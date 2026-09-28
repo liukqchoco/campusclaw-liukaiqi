@@ -1,0 +1,33 @@
+schema: spec-driven
+
+context: |
+  Product: CampusClaw, a class-scoped teaching-material knowledge base.
+  Current change: iteration 2 adds traceable keyword, vector and hybrid retrieval.
+  Stack: React 18 + TypeScript + Vite, Go net/http, MySQL 8, Qdrant, Nginx, Docker Compose.
+  Security: server-side sessions, bcrypt passwords, server-side RBAC and class isolation.
+  Data rule: source text and chunks live in MySQL; Qdrant stores vectors and identifiers only.
+  Delivery: only the web service is exposed; API, database and Qdrant remain on the Compose network.
+
+rules:
+  proposal:
+    - Include explicit Non-goals to prevent scope expansion.
+  design:
+    - Record alternatives and rejection reasons in the submitter's own words.
+    - Keep status codes and trust boundaries consistent with the spec.
+  specs:
+    - Every Requirement must include at least one independently testable Scenario.
+    - Include negative paths for unauthenticated, forbidden-role and cross-class access.
+    - Every retrieval result must be traceable to a material and a MySQL chunk.
+    - No-evidence scenarios must forbid model generation and fabricated citations.
+  tasks:
+    - Every task must include an executable verify statement.
+    - Keep checkboxes unchecked until the corresponding verification has passed.
+
+operations:
+  apply:
+    guidance:
+      - Implement and verify one task at a time.
+      - Do not use client-side UI hiding as access control.
+  archive:
+    guidance:
+      - Archive only after strict validation and behavior verification pass.
