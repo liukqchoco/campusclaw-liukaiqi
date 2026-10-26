@@ -38,6 +38,10 @@ type Server struct {
 	config    config.Config
 	store     *store.Store
 	logger    *slog.Logger
+	llm       *llmClient
+	embedding *embeddingClient
+	qdrant    *qdrantClient
+	mcp       *mcpClient
 	dummyHash []byte
 	handler   http.Handler
 }
@@ -54,9 +58,19 @@ func New(cfg config.Config, dataStore *store.Store, logger *slog.Logger) (*Serve
 	}
 
 	server := &Server{
-		config:    cfg,
-		store:     dataStore,
-		logger:    logger,
+		config: cfg,
+		store:  dataStore,
+		logger: logger,
+		llm:    newLLMClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel, cfg.LLMTimeout),
+		embedding: newEmbeddingClient(
+			cfg.EmbeddingBaseURL,
+			cfg.EmbeddingAPIKey,
+			cfg.EmbeddingModel,
+			cfg.EmbeddingDim,
+			cfg.LLMTimeout,
+		),
+		qdrant:    newQdrantClient(cfg.QdrantURL, cfg.QdrantCollection, cfg.EmbeddingDim),
+		mcp:       newMCPClient(),
 		dummyHash: dummyHash,
 	}
 
@@ -69,6 +83,28 @@ func New(cfg config.Config, dataStore *store.Store, logger *slog.Logger) (*Serve
 	mux.Handle("POST /api/materials", server.requireAuth(http.HandlerFunc(server.handleUploadMaterial)))
 	mux.Handle("GET /api/materials/{id}", server.requireAuth(http.HandlerFunc(server.handleGetMaterial)))
 	mux.Handle("GET /api/materials/{id}/file", server.requireAuth(http.HandlerFunc(server.handleDownloadMaterial)))
+	mux.Handle("POST /api/ask", server.requireAuth(http.HandlerFunc(server.handleAsk)))
+	mux.Handle("GET /api/platform/status", server.requireAuth(http.HandlerFunc(server.handlePlatformStatus)))
+	mux.Handle("GET /api/prompt-templates", server.requireAuth(http.HandlerFunc(server.handleListPromptTemplates)))
+	mux.Handle("PUT /api/prompt-templates/{id}", server.requireAuth(http.HandlerFunc(server.handleUpdatePromptTemplate)))
+	mux.Handle("GET /api/apps", server.requireAuth(http.HandlerFunc(server.handleListApps)))
+	mux.Handle("POST /api/apps", server.requireAuth(http.HandlerFunc(server.handleCreateApp)))
+	mux.Handle("PUT /api/apps/{id}", server.requireAuth(http.HandlerFunc(server.handleUpdateApp)))
+	mux.Handle("GET /api/skills", server.requireAuth(http.HandlerFunc(server.handleListSkills)))
+	mux.Handle("POST /api/skills/upload", server.requireAuth(http.HandlerFunc(server.handleUploadSkill)))
+	mux.Handle("PATCH /api/skills/{id}", server.requireAuth(http.HandlerFunc(server.handleSetSkillEnabled)))
+	mux.Handle("GET /api/conversations", server.requireAuth(http.HandlerFunc(server.handleListConversations)))
+	mux.Handle("POST /api/conversations", server.requireAuth(http.HandlerFunc(server.handleCreateConversation)))
+	mux.Handle("GET /api/conversations/{id}", server.requireAuth(http.HandlerFunc(server.handleGetConversation)))
+	mux.Handle("POST /api/conversations/{id}/messages", server.requireAuth(http.HandlerFunc(server.handleConversationMessage)))
+	mux.Handle("GET /api/traces", server.requireAuth(http.HandlerFunc(server.handleListTraces)))
+	mux.Handle("GET /api/traces/{id}", server.requireAuth(http.HandlerFunc(server.handleGetTrace)))
+	mux.Handle("GET /api/mcp/servers", server.requireAuth(http.HandlerFunc(server.handleListMCPServers)))
+	mux.Handle("POST /api/mcp/servers", server.requireAuth(http.HandlerFunc(server.handleRegisterMCPServer)))
+	mux.Handle("POST /api/mcp/servers/{id}/connect", server.requireAuth(http.HandlerFunc(server.handleConnectMCPServer)))
+	mux.Handle("POST /api/mcp/servers/{id}/disconnect", server.requireAuth(http.HandlerFunc(server.handleDisconnectMCPServer)))
+	mux.Handle("GET /api/mcp/tools", server.requireAuth(http.HandlerFunc(server.handleListMCPTools)))
+	mux.Handle("GET /api/mcp/logs", server.requireAuth(http.HandlerFunc(server.handleListMCPLogs)))
 
 	server.handler = server.withRecovery(server.withSecurityHeaders(server.withRequestLog(mux)))
 	return server, nil
@@ -136,13 +172,19 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := randomToken(32)
+	now := time.Now()
+	sessionToken, err := randomToken(32)
 	if err != nil {
 		s.internalError(w, "生成会话失败", err)
 		return
 	}
-	expiresAt := time.Now().Add(s.config.SessionTTL)
-	if err := s.store.CreateSession(r.Context(), s.sessionHash(token), user.ID, expiresAt); err != nil {
+	accessToken, err := s.issueAccessToken(user.ID, now)
+	if err != nil {
+		s.internalError(w, "生成访问令牌失败", err)
+		return
+	}
+	expiresAt := now.Add(s.config.SessionTTL)
+	if err := s.store.CreateSession(r.Context(), s.sessionHash(sessionToken), user.ID, expiresAt); err != nil {
 		s.databaseUnavailable(w, "创建会话失败", err)
 		return
 	}
@@ -152,7 +194,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
-		Value:    token,
+		Value:    sessionToken,
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   s.config.CookieSecure,
@@ -160,7 +202,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   int(s.config.SessionTTL.Seconds()),
 		Expires:  expiresAt,
 	})
-	writeJSON(w, http.StatusOK, map[string]any{"user": publicUser(user)})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"access_token": accessToken,
+		"token_type":   "Bearer",
+		"expires_in":   int(s.config.JWTTTL.Seconds()),
+		"user":         publicUser(user),
+	})
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -347,7 +394,27 @@ func (s *Server) handleUploadMaterial(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	embeddingStatus := "not_configured"
+	indexedChunks := 0
+	if s.embedding.Configured() && s.qdrant.Configured() {
+		source, sourceErr := s.store.GetKnowledgeSourceForMaterial(r.Context(), id, user.ClassID)
+		if sourceErr != nil {
+			embeddingStatus = "pending"
+			s.logger.Warn("材料已入库但读取知识记录失败", "material_id", id, "error", sourceErr)
+		} else {
+			indexedChunks, err = s.indexKnowledgeSource(r.Context(), source)
+			if err != nil {
+				embeddingStatus = "pending"
+				s.logger.Warn("材料已入库但向量化失败，将在检索时重试", "material_id", id, "error", err)
+			} else {
+				embeddingStatus = "ready"
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusCreated, map[string]any{
+		"embedding_status": embeddingStatus,
+		"indexed_chunks":   indexedChunks,
 		"material": map[string]any{
 			"id":            id,
 			"title":         title,
@@ -359,6 +426,30 @@ func (s *Server) handleUploadMaterial(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if authorization := strings.TrimSpace(r.Header.Get("Authorization")); authorization != "" {
+			parts := strings.Fields(authorization)
+			if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+				writeError(w, http.StatusUnauthorized, "访问令牌无效或已过期")
+				return
+			}
+			userID, err := s.verifyAccessToken(parts[1], time.Now())
+			if err != nil {
+				writeError(w, http.StatusUnauthorized, "访问令牌无效或已过期")
+				return
+			}
+			user, err := s.store.FindUserByID(r.Context(), userID)
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(w, http.StatusUnauthorized, "访问令牌无效或已过期")
+				return
+			}
+			if err != nil {
+				s.databaseUnavailable(w, "读取令牌用户失败", err)
+				return
+			}
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userContextKey, user)))
+			return
+		}
+
 		cookie, err := r.Cookie(sessionCookieName)
 		if err != nil || cookie.Value == "" {
 			writeError(w, http.StatusUnauthorized, "请先登录")

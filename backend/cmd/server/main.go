@@ -49,11 +49,23 @@ func main() {
 		logger.Error("种子数据初始化失败", "error", err)
 		os.Exit(1)
 	}
+	if err := dataStore.SeedAIPlatform(startupContext, cfg.MCPBaseURL, cfg.MCPAuthToken); err != nil {
+		logger.Error("AI 应用平台种子数据初始化失败", "error", err)
+		os.Exit(1)
+	}
 
 	api, err := httpapi.New(cfg, dataStore, logger)
 	if err != nil {
 		logger.Error("API 初始化失败", "error", err)
 		os.Exit(1)
+	}
+	indexContext, indexCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	indexedChunks, indexErr := api.WarmKnowledgeIndex(indexContext)
+	indexCancel()
+	if indexErr != nil {
+		logger.Warn("知识库预向量化失败，将在首次检索时重试", "error", indexErr)
+	} else {
+		logger.Info("知识库向量索引就绪", "new_chunks", indexedChunks)
 	}
 
 	httpServer := &http.Server{
@@ -61,7 +73,7 @@ func main() {
 		Handler:           api.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      5 * time.Minute,
 		IdleTimeout:       60 * time.Second,
 	}
 

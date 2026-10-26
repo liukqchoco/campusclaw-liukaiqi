@@ -17,6 +17,8 @@ type Config struct {
 	DBPassword        string
 	SessionSecret     string
 	SessionTTL        time.Duration
+	JWTSecret         string
+	JWTTTL            time.Duration
 	CookieSecure      bool
 	UploadDir         string
 	MaxUploadBytes    int64
@@ -24,6 +26,20 @@ type Config struct {
 	StudentPassword   string
 	LoginMaxFailures  int
 	LoginLockDuration time.Duration
+	LLMBaseURL        string
+	LLMAPIKey         string
+	LLMModel          string
+	LLMTimeout        time.Duration
+	EmbeddingBaseURL  string
+	EmbeddingAPIKey   string
+	EmbeddingModel    string
+	EmbeddingDim      int
+	QdrantURL         string
+	QdrantCollection  string
+	VectorThreshold   float64
+	RRFK              int
+	MCPBaseURL        string
+	MCPAuthToken      string
 }
 
 func Load() (Config, error) {
@@ -36,6 +52,8 @@ func Load() (Config, error) {
 		"DB_PASSWORD",
 		"SESSION_SECRET",
 		"SESSION_TTL_HOURS",
+		"JWT_SECRET",
+		"JWT_TTL_MINUTES",
 		"UPLOAD_DIR",
 		"MAX_UPLOAD_BYTES",
 		"SEED_TEACHER_PASSWORD",
@@ -62,6 +80,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("SESSION_TTL_HOURS: %w", err)
 	}
+	jwtMinutes, err := positiveInt(values["JWT_TTL_MINUTES"])
+	if err != nil {
+		return Config{}, fmt.Errorf("JWT_TTL_MINUTES: %w", err)
+	}
 	maxUploadBytes, err := positiveInt64(values["MAX_UPLOAD_BYTES"])
 	if err != nil {
 		return Config{}, fmt.Errorf("MAX_UPLOAD_BYTES: %w", err)
@@ -85,8 +107,39 @@ func Load() (Config, error) {
 	if len(values["SESSION_SECRET"]) < 32 {
 		return Config{}, fmt.Errorf("SESSION_SECRET 至少需要 32 个字符")
 	}
+	if len(values["JWT_SECRET"]) < 32 {
+		return Config{}, fmt.Errorf("JWT_SECRET 至少需要 32 个字符")
+	}
 	if len(values["SEED_TEACHER_PASSWORD"]) < 8 || len(values["SEED_STUDENT_PASSWORD"]) < 8 {
 		return Config{}, fmt.Errorf("预置账号口令至少需要 8 个字符")
+	}
+	llmTimeout := 90
+	if raw := strings.TrimSpace(os.Getenv("LLM_TIMEOUT_SECONDS")); raw != "" {
+		llmTimeout, err = positiveInt(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("LLM_TIMEOUT_SECONDS: %w", err)
+		}
+	}
+	embeddingDim := 0
+	if raw := strings.TrimSpace(os.Getenv("EMBEDDING_DIM")); raw != "" {
+		embeddingDim, err = positiveInt(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("EMBEDDING_DIM: %w", err)
+		}
+	}
+	vectorThreshold := 0.35
+	if raw := strings.TrimSpace(os.Getenv("VECTOR_SCORE_THRESHOLD")); raw != "" {
+		vectorThreshold, err = strconv.ParseFloat(raw, 64)
+		if err != nil || vectorThreshold < 0 || vectorThreshold > 1 {
+			return Config{}, fmt.Errorf("VECTOR_SCORE_THRESHOLD 必须是 0～1 的数")
+		}
+	}
+	rrfK := 60
+	if raw := strings.TrimSpace(os.Getenv("RRF_K")); raw != "" {
+		rrfK, err = positiveInt(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("RRF_K: %w", err)
+		}
 	}
 
 	return Config{
@@ -98,6 +151,8 @@ func Load() (Config, error) {
 		DBPassword:        values["DB_PASSWORD"],
 		SessionSecret:     values["SESSION_SECRET"],
 		SessionTTL:        time.Duration(sessionHours) * time.Hour,
+		JWTSecret:         values["JWT_SECRET"],
+		JWTTTL:            time.Duration(jwtMinutes) * time.Minute,
 		CookieSecure:      cookieSecure,
 		UploadDir:         values["UPLOAD_DIR"],
 		MaxUploadBytes:    maxUploadBytes,
@@ -105,6 +160,20 @@ func Load() (Config, error) {
 		StudentPassword:   values["SEED_STUDENT_PASSWORD"],
 		LoginMaxFailures:  loginMaxFailures,
 		LoginLockDuration: time.Duration(lockMinutes) * time.Minute,
+		LLMBaseURL:        strings.TrimRight(strings.TrimSpace(os.Getenv("LLM_BASE_URL")), "/"),
+		LLMAPIKey:         strings.TrimSpace(os.Getenv("LLM_API_KEY")),
+		LLMModel:          strings.TrimSpace(os.Getenv("LLM_MODEL")),
+		LLMTimeout:        time.Duration(llmTimeout) * time.Second,
+		EmbeddingBaseURL:  strings.TrimRight(strings.TrimSpace(os.Getenv("EMBEDDING_BASE_URL")), "/"),
+		EmbeddingAPIKey:   strings.TrimSpace(os.Getenv("EMBEDDING_API_KEY")),
+		EmbeddingModel:    strings.TrimSpace(os.Getenv("EMBEDDING_MODEL")),
+		EmbeddingDim:      embeddingDim,
+		QdrantURL:         strings.TrimRight(strings.TrimSpace(os.Getenv("QDRANT_URL")), "/"),
+		QdrantCollection:  strings.TrimSpace(os.Getenv("QDRANT_COLLECTION")),
+		VectorThreshold:   vectorThreshold,
+		RRFK:              rrfK,
+		MCPBaseURL:        strings.TrimRight(strings.TrimSpace(os.Getenv("MCP_BASE_URL")), "/"),
+		MCPAuthToken:      strings.TrimSpace(os.Getenv("MCP_AUTH_TOKEN")),
 	}, nil
 }
 

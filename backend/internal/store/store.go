@@ -55,6 +55,14 @@ type NewMaterial struct {
 	Content      string
 }
 
+type KnowledgeSource struct {
+	ClassID          int64
+	KnowledgeEntryID int64
+	MaterialID       int64
+	MaterialTitle    string
+	Content          string
+}
+
 func Open(host, port, name, user, password string) (*Store, error) {
 	cfg := mysqlDriver.NewConfig()
 	cfg.User = user
@@ -190,6 +198,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 			CONSTRAINT fk_knowledge_class FOREIGN KEY (class_id) REFERENCES classes(id)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 	}
+	statements = append(statements, aiMigrationStatements()...)
 
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -230,6 +239,34 @@ func (s *Store) Seed(ctx context.Context, teacherPassword, studentPassword, uplo
 	}
 
 	if err = s.ensureSeedMaterial(ctx, classA, teacherA, "A 班开学说明", "a-class-welcome.md", "seed-a-class.md", "# A 班开学说明\n\n欢迎进入高一（1）班知识库。\n", uploadDir); err != nil {
+		return err
+	}
+	scienceContent := `# 小学科学课程资料
+
+## 磁铁
+
+磁铁能吸引铁钉，不能吸引木块。磁铁只会吸引铁、钴、镍等铁磁性材料，不会吸引木头、塑料和玻璃。
+
+## 水的三态
+
+水在零摄氏度附近结成冰，加热到一百摄氏度附近沸腾并变成水蒸气。
+`
+	if err = s.ensureSeedMaterial(ctx, classA, teacherA, "A 班小学科学课程资料", "science-notes.md", "seed-a-science.md", scienceContent, uploadDir); err != nil {
+		return err
+	}
+	mathContent := `# 数学单位换算资料
+
+## 长度单位
+
+1 米等于 100 厘米。厘米换算成米时，数值除以 100；米换算成厘米时，数值乘以 100。
+
+1 千米等于 1000 米，1 米等于 1000 毫米。换算前应先确认原单位、目标单位和量纲。
+
+## 质量单位
+
+1 千克等于 1000 克。长度单位与质量单位不能跨量纲换算。
+`
+	if err = s.ensureSeedMaterial(ctx, classA, teacherA, "A 班数学单位换算资料", "math-unit-notes.md", "seed-a-math.md", mathContent, uploadDir); err != nil {
 		return err
 	}
 	if err = s.ensureSeedMaterial(ctx, classB, studentB, "B 班学习安排", "b-class-plan.md", "seed-b-class.md", "# B 班学习安排\n\n本材料仅供高一（2）班查看。\n", uploadDir); err != nil {
@@ -309,6 +346,18 @@ func (s *Store) FindUserByUsername(ctx context.Context, username string) (User, 
 		WHERE u.username = ?`,
 		username,
 	).Scan(&user.ID, &user.Username, &user.DisplayName, &user.Role, &user.ClassID, &user.ClassName, &user.PasswordHash)
+	return user, err
+}
+
+func (s *Store) FindUserByID(ctx context.Context, id int64) (User, error) {
+	var user User
+	err := s.db.QueryRowContext(ctx, `
+		SELECT u.id, u.username, u.display_name, u.role, u.class_id, c.name
+		FROM users u
+		JOIN classes c ON c.id = u.class_id
+		WHERE u.id = ?`,
+		id,
+	).Scan(&user.ID, &user.Username, &user.DisplayName, &user.Role, &user.ClassID, &user.ClassName)
 	return user, err
 }
 
@@ -440,6 +489,74 @@ func (s *Store) ListMaterials(ctx context.Context, classID int64, search string)
 		materials = append(materials, material)
 	}
 	return materials, rows.Err()
+}
+
+func (s *Store) ListKnowledgeSources(ctx context.Context, classID int64) ([]KnowledgeSource, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT k.class_id, k.id, m.id, m.title, k.content
+		FROM materials m
+		JOIN knowledge_entries k ON k.material_id = m.id
+		WHERE m.class_id = ? AND k.class_id = ?
+		ORDER BY m.id`,
+		classID, classID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	sources := make([]KnowledgeSource, 0)
+	for rows.Next() {
+		var source KnowledgeSource
+		if err := rows.Scan(&source.ClassID, &source.KnowledgeEntryID, &source.MaterialID, &source.MaterialTitle, &source.Content); err != nil {
+			return nil, err
+		}
+		sources = append(sources, source)
+	}
+	return sources, rows.Err()
+}
+
+func (s *Store) ListAllKnowledgeSources(ctx context.Context) ([]KnowledgeSource, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT k.class_id, k.id, m.id, m.title, k.content
+		FROM knowledge_entries k
+		JOIN materials m ON m.id = k.material_id AND m.class_id = k.class_id
+		ORDER BY k.class_id, m.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	sources := make([]KnowledgeSource, 0)
+	for rows.Next() {
+		var source KnowledgeSource
+		if err := rows.Scan(&source.ClassID, &source.KnowledgeEntryID, &source.MaterialID, &source.MaterialTitle, &source.Content); err != nil {
+			return nil, err
+		}
+		sources = append(sources, source)
+	}
+	return sources, rows.Err()
+}
+
+func (s *Store) GetKnowledgeSourceForMaterial(
+	ctx context.Context,
+	materialID, classID int64,
+) (KnowledgeSource, error) {
+	var source KnowledgeSource
+	err := s.db.QueryRowContext(ctx, `
+		SELECT k.class_id, k.id, m.id, m.title, k.content
+		FROM knowledge_entries k
+		JOIN materials m ON m.id = k.material_id AND m.class_id = k.class_id
+		WHERE m.id = ? AND m.class_id = ?`,
+		materialID, classID,
+	).Scan(
+		&source.ClassID,
+		&source.KnowledgeEntryID,
+		&source.MaterialID,
+		&source.MaterialTitle,
+		&source.Content,
+	)
+	return source, err
 }
 
 func (s *Store) GetMaterial(ctx context.Context, id, classID int64) (Material, error) {
